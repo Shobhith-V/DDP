@@ -1,0 +1,289 @@
+This file explains the contents of `donn.py` in a beginner-friendly way.
+
+----------------------------------------------------------------------
+1. Overall purpose of `donn.py`
+----------------------------------------------------------------------
+
+The `donn.py` file defines several small building blocks that are useful
+for modelling oscillations (things that repeat in time, like sine waves)
+with PyTorch.  All of them are written using complex numbers, which
+lets the code represent an oscillator’s state as a single complex value
+instead of separate sine and cosine components.
+
+At a high level, `donn.py` provides:
+
+- simple complex-valued activation functions (`cReLU`, `cLeakyReLU`)
+- a basic Hopf-oscillator-based module (`MuHopf`)
+- two residual-style Hopf modules (`ResHopf` and `SingledtResHopf`)
+
+You can plug these modules into a larger neural network or simulation
+to generate time series that behave like coupled oscillators.
+
+
+----------------------------------------------------------------------
+2. Complex activation functions: `cReLU` and `cLeakyReLU`
+----------------------------------------------------------------------
+
+In standard deep learning, an activation like ReLU is applied to a
+real-valued tensor.  Here we want to work with complex tensors
+(`torch.complex64` or `torch.complex128`), so we define activations
+that act on the real and imaginary parts separately.
+
+2.1 `cReLU(x)`
+--------------
+
+`cReLU` takes a complex tensor `x` and:
+
+1. extracts its real part: `torch.real(x)`
+2. extracts its imaginary part: `torch.imag(x)`
+3. applies `torch.relu` to each part independently
+4. recombines the two processed parts into a single complex tensor
+
+So if `x = a + i b`, then:
+- real part becomes `ReLU(a)`
+- imaginary part becomes `ReLU(b)`
+
+This is useful when you want a non-linearity for complex-valued features
+but still keep the overall structure as a complex number.
+
+2.2 `cLeakyReLU(x)`
+--------------------
+
+`cLeakyReLU` does the same kind of splitting, but uses a LeakyReLU
+instead of a hard ReLU:
+
+- `torch.nn.LeakyReLU()(torch.real(x))`
+- `torch.nn.LeakyReLU()(torch.imag(x))`
+
+LeakyReLU gives a small negative slope for negative inputs instead of
+clamping them exactly to zero, which can help with gradient flow.
+
+
+----------------------------------------------------------------------
+3. The Hopf oscillator idea (high level)
+----------------------------------------------------------------------
+
+A Hopf oscillator is a simple mathematical model that describes how a
+system can start oscillating.  It is often written in terms of a radius
+`r` (how big the oscillation is) and a phase `phi` (where we are in the
+cycle).
+
+Very roughly:
+
+- `r` is pushed toward a preferred value (so it doesn’t blow up or
+  vanish)
+- `phi` rotates at some angular frequency `omega`
+- by taking `r * cos(phi)` and `r * sin(phi)` we can reconstruct a
+  2D representation of the oscillator’s state
+- or we can combine them into a complex number `z = r * exp(i * phi)`
+
+The classes in `donn.py` simulate these dynamics using small Euler steps
+(a simple numerical integration method).
+
+
+----------------------------------------------------------------------
+4. Class `MuHopf`
+----------------------------------------------------------------------
+
+Signature:
+- `MuHopf(input_dim, dt, num_steps, min_omega, max_omega, device="cpu")`
+
+Key ideas:
+
+- `input_dim`: number of oscillators or features
+- `dt`: time step for integration
+- `num_steps`: how many time steps we simulate
+- `min_omega` and `max_omega`: lower and upper bounds for the oscillator
+  frequencies
+- learns a set of frequencies `omegas` for each dimension
+
+Constructor (`__init__`):
+-------------------------
+
+- `self.omegas` is a learnable parameter of shape `(input_dim,)`
+  initialised randomly.
+- We store `min_omega`, `max_omega`, `dt`, a base value `mu0 = 1.0`,
+  and the number of time steps.
+
+Forward pass:
+-------------
+
+The forward method takes three tensors of the same shape:
+
+- `x`: input signal (could be a bias on `mu`)
+- `r`: initial radii (one per dimension)
+- `phi`: initial phases (one per dimension)
+
+It asserts that all three have the same size, then:
+
+1. Builds a list `output` to store the complex oscillator values at
+   each time step.
+2. Converts the raw parameter `self.omegas` into usable frequencies:
+   - apply `sigmoid` so they live in `(0, 1)`
+   - scale to `[min_omega, max_omega]`
+   - multiply by `2π` to get angular frequencies (radians per second)
+3. For each time step from `0` to `num_steps-1`:
+   - compute `mu = 5 * (mu0 + x)`, so the input `x` shifts the
+     Hopf parameter
+   - update radius:
+       `r = r + ((mu - r**2) * r) * dt`
+     This term stabilises the radius around a certain value.
+   - update phase:
+       `phi = phi + omegas * dt`
+     This just advances the angle with constant angular speed.
+   - compute the real and imaginary coordinates:
+       `z_r = r * cos(phi)`
+       `z_i = r * sin(phi)`
+   - pack them into a complex tensor `z_t = complex(z_r, z_i)` and
+     append to `output`
+4. Finally, stack all time steps into a tensor of shape
+   `(num_steps, ...)` and return `(output_stack, r, phi)`:
+   - `output_stack`: full complex trajectory over time
+   - `r` and `phi`: final radius and phase after the last step
+
+
+----------------------------------------------------------------------
+5. Class `ResHopf`
+----------------------------------------------------------------------
+
+Signature:
+- `ResHopf(units, min_omega, max_omega, dt, train_omegas=True, input_scaler=5.0, ...)`
+
+Purpose:
+--------
+
+`ResHopf` is a *residual* Hopf layer.  Instead of simulating a single
+oscillator driven only by `mu`, it:
+
+- takes a complex input sequence `X` over time
+- uses this as an additional drive on the Hopf dynamics at each time
+  step
+- returns the full sequence of complex outputs
+
+Key attributes:
+---------------
+
+- `units`: number of oscillators
+- `min_omega`, `max_omega`, `dt`: as before
+- `mu0`: base Hopf parameter (1.0)
+- `beta1`: coefficient on the `r**2` term
+- `input_scaler`: scales how strongly the input drives the oscillator
+- `self.omegas`: learnable frequency parameters of shape `(1, units)`
+
+Forward pass:
+-------------
+
+Inputs:
+
+- `X`: complex tensor of shape `[T, units]` (time × features)
+- `r`: initial radii, shape `[units]`
+- `phi`: initial phases, shape `[units]`
+
+Steps:
+
+1. Split `X` into real and imaginary parts:
+   - `Xr = real(X)`
+   - `Xi = imag(X)`
+2. Check that shapes are consistent:
+   - each time slice in `Xr` must match `r` and `phi`
+3. Allocate storage for the trajectory:
+   - `r_save` and `phi_save` of shape `[T, units]`
+4. Convert `self.omegas` into angular frequencies (same way as in
+   `MuHopf`).
+5. Loop over each time index `t`:
+   - form an input term that depends on both `X` and the current
+     phase:
+       `input_r = input_scaler * Xr[t] * cos(phi)`
+       `input_phi = input_scaler * Xi[t] * sin(phi)`
+   - update radius:
+       `r = r + ((mu0 - beta1 * (r**2)) * r + input_r) * dt`
+   - update phase:
+       `phi = phi + (omegas - input_phi) * dt`
+   - store the updated `r` and `phi` in `r_save[t]` and `phi_save[t]`
+6. After the loop, convert the stored radii and phases back into
+   complex values:
+   - `z_r = r_save * cos(phi_save)`
+   - `z_i = r_save * sin(phi_save)`
+   - return `complex(z_r, z_i), r, phi`
+
+So `ResHopf` gives you:
+
+- a sequence of complex oscillator states over time
+- plus the final radius and phase (useful if you want to continue
+  the simulation later)
+
+
+----------------------------------------------------------------------
+6. Class `SingledtResHopf`
+----------------------------------------------------------------------
+
+Signature:
+- `SingledtResHopf(units, min_omega, max_omega, dt, train_omegas=True, input_scaler=5.0, ...)`
+
+This is a variant of `ResHopf` with a slightly different API and
+behaviour.
+
+Key differences from `ResHopf`:
+-------------------------------
+
+- The inputs `X`, `r` and `phi` are all full tensors of the same shape
+  (for example, they might already encode multiple time steps), rather
+  than `r` and `phi` being just a single initial state and `X` being a
+  time‑series.
+- The update is applied once rather than having an explicit loop over
+  time steps in the forward method.
+- `self.omegas` is initialised with `torch.randn` instead of `torch.rand`.
+
+Forward pass (conceptually):
+----------------------------
+
+1. Extract real and imaginary parts:
+   - `Xr = real(X)`
+   - `Xi = imag(X)`
+2. Check that:
+   - `Xr` and `Xi` have the same shape
+   - `r` and `phi` have the same shape as `Xr`
+3. Compute the angular frequencies `omegas` in the same way as before.
+4. Form the driving inputs:
+   - `input_r = input_scaler * Xr * cos(phi)`
+   - `input_phi = input_scaler * Xi * sin(phi)`
+5. Euler update:
+   - `r = r + ((mu0 - beta1 * (r**2)) * r + input_r) * dt`
+   - `phi = phi + (omegas - input_phi) * dt`
+6. Convert back to complex:
+   - `z_r = r * cos(phi)`
+   - `z_i = r * sin(phi)`
+   - return `complex(z_r, z_i), r, phi`
+
+You can think of `SingledtResHopf` as a one-step residual Hopf layer
+operating elementwise over the input tensors, useful when you already
+have sequences and just want to apply one update instead of looping
+inside the module.
+
+
+----------------------------------------------------------------------
+7. How you might use these modules
+----------------------------------------------------------------------
+
+Here is a high-level usage pattern, skipping details:
+
+1. Choose how many oscillators you want (e.g. `units = 32`).
+2. Create initial radius and phase:
+   - `r0 = torch.ones(units)`
+   - `phi0 = torch.zeros(units)`
+3. Create some complex input sequence `X` (e.g. from another network or
+   from data).
+4. Pass them through `ResHopf`:
+   - `layer = ResHopf(units, min_omega=1.0, max_omega=20.0, dt=0.01)`
+   - `Z, r_final, phi_final = layer(X, r0, phi0)`
+5. Use `Z` as a complex time series representation of your oscillators
+   when training a larger model.
+
+For simpler or more controlled experiments you might use `MuHopf` to
+generate oscillator trajectories directly, or `SingledtResHopf` as a
+single residual step in a deeper network.
+
+The key takeaway is that `donn.py` wraps the mathematical equations for
+Hopf oscillators in neat, reusable PyTorch modules so that you can
+include oscillatory dynamics inside standard neural network pipelines.
+
