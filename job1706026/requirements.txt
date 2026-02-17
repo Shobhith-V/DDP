@@ -1,0 +1,7 @@
+numpy
+scipy
+matplotlib
+torch
+torchdiffeq
+mne
+pyyaml

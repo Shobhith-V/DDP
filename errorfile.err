@@ -1,0 +1,2 @@
+  File "braincode_2.py", line 61
+SyntaxError: Non-ASCII character '\xe2' in file braincode_2.py on line 62, but no encoding declared; see http://www.python.org/peps/pep-0263.html for details
