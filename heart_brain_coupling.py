@@ -51,7 +51,7 @@ import matplotlib
 matplotlib.use("Agg")          # non-interactive backend for cluster use
 import matplotlib.pyplot as plt
 from scipy.io import loadmat
-from scipy.signal import butter, filtfilt, detrend
+from scipy.signal import butter, filtfilt, detrend, decimate
 from scipy.interpolate import interp1d
 
 import torch
@@ -1092,8 +1092,20 @@ def main():
     # Full time vector for simulation
     t = np.arange(0, args.t_duration, 1.0 / args.fs)   # (200,) at fs=100
 
-    # OPT 1: precompute D as a GPU tensor once
-    target_signal = eeg_proc[args.target_idx, ::10]
+    # Build target EEG signal at simulation rate (100 Hz).
+    # IMPORTANT: naive ::10 downsampling aliases the signal to near-zero for
+    # many EEG channels. Instead we:
+    #   1. Decimate raw EEG from 1000 Hz → 100 Hz with anti-aliasing filter
+    #   2. Bandpass the decimated signal at 100 Hz
+    #   3. Z-score normalise
+    # This preserves the true signal energy at the target region.
+    raw_target = eeg_data[args.target_idx]          # (2000,) at 1000 Hz
+    decimated  = decimate(raw_target, q=10, ftype="fir", zero_phase=True)  # (200,) at 100 Hz
+    target_signal = bandpass_normalise(decimated, fs=args.fs, lowcut=0.5, highcut=40.0)
+
+    log.info("Target EEG (region %d): std=%.4f  max=%.4f",
+             args.target_idx, target_signal.std(), np.abs(target_signal).max())
+
     D_tensor = make_D_tensor(target_signal, t, device)   # (200,) on GPU
 
     # ------------------------------------------------------------------
