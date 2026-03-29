@@ -1,12 +1,15 @@
 #!/bin/bash
-#PBS -o logfile.log
-#PBS -e errorfile.err
-#PBS -l walltime=02:00:00
-#PBS -l select=1:ncpus=1
-tpdir=`echo $PBS_JOBID | cut -f 1 -d .`
-tempdir=$HOME/scratch/job$tpdir
-mkdir -p $tempdir
-cd $tempdir
-cp -R $PBS_O_WORKDIR/* .
-python braincode_2.py
-mv ../job$tpdir $PBS_O_WORKDIR/. 
+#PBS -N brain_heart
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -o output.log
+#PBS -e error.log
+
+cd $PBS_O_WORKDIR
+
+module load python
+source ~/env/bin/activate
+
+export OMP_NUM_THREADS=8
+
+python cluster.py
