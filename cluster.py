@@ -1,10 +1,3 @@
-"""
-v13_pipeline.py  —  Brain-Heart Coupled Oscillator Model
-Run on cluster: python v13_pipeline.py
-
-All tunable hyper-parameters live in CONFIG.
-"""
-
 import gc
 import os
 import sys
@@ -33,7 +26,7 @@ CONFIG = {
     "sc_path":   "SC_CC120309-27.mat",
 
     "ecg_channel_idx": 322,
-    "target_eeg_idx":  12,
+    "target_eeg_idx":  9,
     "fs_raw":          1000,
     "fs_model":        100,
     "train_sec":       10,
@@ -44,18 +37,18 @@ CONFIG = {
     "ecg_lowcut":   1.5,
     "ecg_highcut":  20.0,
     "eeg_lowcut":   0.5,
-    "eeg_highcut":  20.0,
+    "eeg_highcut":  30.0,
     "butter_order": 4,
 
     # Structural connectivity
-    "sc_scale":      0.01,
-    "sc_percentile": 60,
-    "sc_osc_scale":  10.0,
+    "sc_scale":      0.5,
+    "sc_percentile": 40,
+    "sc_osc_scale":  30.0,
 
     # Brain oscillator
     "osc_per_region": 4,
     "freq_low_hz":    1.0,
-    "freq_high_hz":   20.0,
+    "freq_high_hz":   30.0,
     "intra_coupling": 0.0001,
     "brain_seed":     42,
 
@@ -86,11 +79,11 @@ CONFIG = {
     "brain_mu": 1.0,
 
     # Stage 1b
-    "brain_epochs":          300,
+    "brain_epochs":          200,
     "brain_settle":          10,
     "brain_log_every":       50,
     "brain_eta_omega":       0.05,
-    "brain_eta_alpha":       0.03,
+    "brain_eta_alpha":       0.1,
     "brain_eta_theta":       0.05,
 
     # ECGToOscillatorMLP
@@ -100,7 +93,7 @@ CONFIG = {
     "vns_sparsity": 0.3,
 
     # Stage 2
-    "stage2_epochs":          200,
+    "stage2_epochs":          300,
     "stage2_lr":              5e-3,
     "stage2_sched_factor":    0.3,
     "stage2_sched_patience":  15,
@@ -109,9 +102,9 @@ CONFIG = {
     "stage2_min_lr":          1e-5,
     "stage2_settle_frac":     0.1,
     "stage2_grad_clip":       1.0,
-    "stage2_log_every":       10,
+    "stage2_log_every":       50,
     "stage2_alpha_lr":        1e-3,
-    "stage2_alpha_reg":       0.1,
+    "stage2_alpha_reg":       0.01,
     "stage2_hidden_noise":    0.01,
 
     # BrainToHeartFeedbackMLP
@@ -129,7 +122,7 @@ CONFIG = {
     "stage4_log_every":      20,
 
     "save_root": "multi_region_results",
-    "regions":   [12],
+    "regions":   [30,31,32,33],
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -150,10 +143,8 @@ def preprocess_signal(signal, fs=1000, lowcut=1.5, highcut=20, order=4):
 
 
 def get_random_frequencies(num_regions, osc_per_region, low=1, high=20, seed=None):
-    if seed is not None:
-        np.random.seed(seed)
     total = num_regions * osc_per_region
-    return 2 * np.pi * np.random.uniform(low, high, total)
+    return 2 * np.pi * np.linspace(low, high, total)
 
 
 def expand_structural_connectivity(Sc_region, osc_per_region,
@@ -175,10 +166,6 @@ def expand_structural_connectivity(Sc_region, osc_per_region,
                 Sc_full[si:ei, sj:ej] = blk
     np.fill_diagonal(Sc_full, 0.0)
     return Sc_full
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Loss
-# ──────────────────────────────────────────────────────────────────────────────
 
 class CorrelationLoss(nn.Module):
     def __init__(self, eps=1e-8):
@@ -293,10 +280,7 @@ class OscillatorODEFunc(nn.Module):
 
         # Fast integer indexing — preserves gradient flow
         if self.input_features_sequence is not None:
-            t_idx   = torch.clamp(
-                (t * self.fs).long(), 0,
-                self.input_features_sequence.shape[0] - 1
-            )
+            t_idx = torch.clamp((t * self.fs).long(), 0, self.input_features_sequence.shape[0] - 1)
             input_f = self.input_features_sequence[t_idx].unsqueeze(-1)
         else:
             input_f = torch.zeros_like(r)
@@ -329,7 +313,7 @@ class OscillatorLayer(nn.Module):
         self.fs    = fs
         torch.manual_seed(seed)
 
-        freqs            = 2.0 + torch.rand(N_osc, device=device) * 8.0
+        freqs = torch.linspace(2.0, 10.0, N_osc, device=device)
         self.mu_param    = nn.Parameter(torch.tensor(1.0,  device=device))
         self.k_param     = nn.Parameter(torch.tensor(0.01, device=device))
         self.omega_param = nn.Parameter(2 * torch.pi * freqs)
@@ -361,7 +345,9 @@ class OscillatorLayer(nn.Module):
         sol = odeint(self.ode_func, y0, t_eval, method="rk4")
         self.ode_func.input_features_sequence = None
 
-        return sol   # (T, 2*N_osc) — [r | phi]
+        r   = sol[:, :self.N_osc]
+        phi = sol[:, self.N_osc:]
+        return r * torch.cos(phi) 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ECGToOscillatorMLP  (Stage 2)
@@ -382,8 +368,10 @@ class ECGToOscillatorMLP(nn.Module):
             coupling_sparsity=coupling_sparsity, seed=seed,
         )
         self.post_osc = nn.Sequential(
-            nn.Linear(N_VNS, hidden_dim),   nn.SiLU(),
+            nn.Linear(N_VNS, hidden_dim), nn.SiLU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_dim, output_dim),
         )
 
@@ -392,9 +380,8 @@ class ECGToOscillatorMLP(nn.Module):
             ecg_features = ecg_features.unsqueeze(0)
         x          = self.input_norm(ecg_features)
         pre        = self.pre_osc(x)
-        osc_hidden = self.osc_layer(pre)            # (T, 2*N_VNS)
-        r_comps    = osc_hidden[:, :self.osc_layer.N_osc]   # radii only
-        brain_drive = self.post_osc(r_comps)
+        osc_hidden  = self.osc_layer(pre)            # (T, N_VNS)
+        brain_drive = self.post_osc(osc_hidden)
         return brain_drive.squeeze(0) if brain_drive.shape[0] == 1 else brain_drive
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -423,8 +410,7 @@ class BrainToHeartFeedbackMLP(nn.Module):
             rcos_phi = rcos_phi.unsqueeze(0)
         pre        = self.pre_osc(rcos_phi)
         osc_hidden = self.osc_layer(pre)
-        r_comps    = osc_hidden[:, :self.osc_layer.N_osc]
-        return self.post_osc(r_comps)
+        return self.post_osc(osc_hidden)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Brain ODE
@@ -482,7 +468,8 @@ class ODEFuc(nn.Module):
 
         omega_safe = torch.clamp(omega, 2 * np.pi * 0.5, 2 * np.pi * 20)
         r          = torch.clamp(r, 1e-1, 4.0)
-        alpha      = torch.clamp(alpha, -3.0, 3.0)
+        if not self.learn_alpha:
+            alpha = torch.clamp(alpha, -3.0, 3.0)
 
         phase_diff = torch.clamp(
             phi[None, :] / omega_safe[None, :] -
@@ -652,7 +639,8 @@ def pre_train_brain_model(eeg_processed, Sw_all, target_idx,
         omega_full[i * osc_per_region:(i + 1) * osc_per_region]
         for i in connected_indices
     ])
-    alpha0       = np.ones(N) * (1.0 / np.sqrt(N))
+    rng = np.random.RandomState(cfg["brain_seed"])
+    alpha0 = rng.choice([-1, 1], size=N) * (1.0 / np.sqrt(N))
     theta_random = np.pi * (2 * np.random.rand(N, N) - 1)
     theta0       = theta_random - theta_random.T
     r0           = np.ones(N)
@@ -665,7 +653,7 @@ def pre_train_brain_model(eeg_processed, Sw_all, target_idx,
         fs=cfg["fs_model"], fixed_params=None, device=device,
         eta_omega=cfg["brain_eta_omega"],
         eta_alpha=cfg["brain_eta_alpha"],
-        eta_theta=cfg["brain_eta_theta"],
+        eta_theta=cfg["brain_eta_theta"],learn_alpha=False
     )
 
     D_true = torch.tensor(D_full_train, device=device, dtype=torch.float32)
@@ -679,11 +667,10 @@ def pre_train_brain_model(eeg_processed, Sw_all, target_idx,
             settle     = cfg["brain_settle"]
             pred       = P_out[settle:]
             tgt        = D_true[settle:]
-            P_norm     = pred * (tgt.std() / (pred.std() + 1e-8))
-            mse_loss   = torch.mean((P_norm - tgt) ** 2)
-            corr_loss  = CorrelationLoss()(pred, tgt)
-            scale_loss = (pred.std() / (tgt.std() + 1e-8) - 1.0) ** 2
-            loss       = mse_loss + 0.3 * corr_loss + 0.5 * scale_loss
+            P_norm    = pred * (tgt.std() / (pred.std() + 1e-8))
+            mse_loss  = torch.mean((P_norm - tgt) ** 2)
+            corr_loss = CorrelationLoss()(pred, tgt)
+            loss      = mse_loss + 0.3 * corr_loss
             losses.append(loss.item())
 
             r0     = r[-1].cpu().numpy()
@@ -706,6 +693,9 @@ def pre_train_brain_model(eeg_processed, Sw_all, target_idx,
                   f"P_std: {P_out.std().item():.4f}  "
                   f"D_std: {D_true.std().item():.4f}")
 
+    print(f"  Hebbian alpha abs_mean: {np.abs(alpha0).mean():.4f}  "
+      f"max: {np.abs(alpha0).max():.4f}")
+
     final_params = {
         "r": r0, "phi": phi0, "theta": theta0, "omega": omega0, "alpha": alpha0,
     }
@@ -714,7 +704,7 @@ def pre_train_brain_model(eeg_processed, Sw_all, target_idx,
 
 def train_mlp_on_frozen_brain(trained_heart_model, heart_osc_layer,
                                initial_brain_params, Sc_reduced_osc,
-                               N, D_function, t, cfg, device, t_sec):
+                               N, D_function, t, t_test, cfg, device, t_sec):
     print("\n--- Stage 2: ECG → Brain Training ---")
 
     ecg_to_osc_mlp = ECGToOscillatorMLP(
@@ -736,12 +726,11 @@ def train_mlp_on_frozen_brain(trained_heart_model, heart_osc_layer,
         mu=cfg["brain_mu"], D_full=D_full_train, N=N,
         Sc=Sc_reduced_osc, brain_drive_full=None,
         fs=cfg["fs_model"], fixed_params=initial_brain_params,
-        device=device, learn_alpha=True,
+        device=device, learn_alpha=False,
     )
 
     optimizer = torch.optim.Adam([
-        {"params": ecg_to_osc_mlp.parameters(),        "lr": cfg["stage2_lr"]},
-        {"params": [model.ode_func.alpha_param],        "lr": cfg["stage2_alpha_lr"]},
+        {"params": ecg_to_osc_mlp.parameters(), "lr": cfg["stage2_lr"]},
     ])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min",
@@ -751,13 +740,21 @@ def train_mlp_on_frozen_brain(trained_heart_model, heart_osc_layer,
         cooldown=cfg["stage2_sched_cooldown"],
         min_lr=cfg["stage2_min_lr"],
     )
-    criterion        = CorrelationLoss()
+    criterion = nn.MSELoss()
     alpha_reg_weight = cfg["stage2_alpha_reg"]
     losses           = []
 
+    T_test_steps = int((cfg["test_sec"]) * cfg["fs_model"])
+
+    T_total = T_steps + int(cfg["test_sec"] * cfg["fs_model"])
     with torch.no_grad():
-        sim_input   = heart_osc_layer(T_steps, modulation=None)
-        hidden_repr = trained_heart_model.get_features(sim_input)
+        sim_input_full   = heart_osc_layer(T_total, modulation=None)
+        hidden_full      = trained_heart_model.get_features(sim_input_full)
+        hidden_repr      = hidden_full[:T_steps]
+        hidden_repr_test = hidden_full[T_steps:]
+
+    D_full_test = D_function(t_test)
+    D_true_test = torch.tensor(D_full_test, device=device, dtype=torch.float32)
 
     for epoch in range(cfg["stage2_epochs"]):
         hidden_noisy = hidden_repr
@@ -773,37 +770,41 @@ def train_mlp_on_frozen_brain(trained_heart_model, heart_osc_layer,
         pred  = P_out[settle:]
         tgt   = D_true[settle:]
 
-        P_norm     = pred * (tgt.std() / (pred.std() + 1e-8))
-        mse_loss   = torch.mean((P_norm - tgt) ** 2)
-        corr_loss  = criterion(pred, tgt)
-        scale_loss = (pred.std() / (tgt.std() + 1e-8) - 1.0) ** 2
-        alpha_pen  = torch.mean(torch.relu(0.25 - model.ode_func.alpha_param ** 2))
-        loss = mse_loss + 0.3 * corr_loss + 0.5 * scale_loss + alpha_reg_weight * alpha_pen
-
+        P_norm    = pred * (tgt.std() / (pred.std() + 1e-8))
+        loss = criterion(P_norm, tgt)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(ecg_to_osc_mlp.parameters()) + [model.ode_func.alpha_param],
+            list(ecg_to_osc_mlp.parameters()),
             max_norm=cfg["stage2_grad_clip"],
         )
         optimizer.step()
-
-        with torch.no_grad():
-            model.ode_func.alpha_param.clamp_(-3.0, 3.0)
-
         scheduler.step(loss.item())
+        if (epoch + 1) % cfg["stage2_log_every"] == 0:
+            with torch.no_grad():
+                raw_drive_test   = ecg_to_osc_mlp(hidden_repr_test)
+                brain_drive_test = torch.clamp(raw_drive_test, -5.0, 5.0)
+                model.ode_func.brain_drive_full = brain_drive_test
+
+                r_val, phi_val, _, _, alpha_val, _ = model.solve(
+                    initial_brain_params["r"], initial_brain_params["phi"],
+                    t_test, use_adjoint=False,
+                )
+                P_val    = torch.sum(alpha_val * r_val * torch.cos(phi_val), dim=1)
+                p0       = P_val - P_val.mean()
+                t0       = D_true_test - D_true_test.mean()
+                val_corr = (p0 * t0).sum() / (
+                    torch.sqrt((p0**2).sum() * (t0**2).sum()) + 1e-8
+                )
+
+            lr = optimizer.param_groups[0]["lr"]
+            print(f"  Epoch {epoch+1:3d}/{cfg['stage2_epochs']}  "
+                f"Loss: {loss.item():.6f}  "
+                f"Val Corr: {val_corr.item():.4f}  "
+                f"LR: {lr:.3e}")
         losses.append(loss.item())
 
-        if (epoch + 1) % cfg["stage2_log_every"] == 0:
-            lr        = optimizer.param_groups[0]["lr"]
-            alpha_std = model.ode_func.alpha_param.std().item()
-            alpha_abs = model.ode_func.alpha_param.abs().mean().item()
-            print(f"  Epoch {epoch+1:3d}/{cfg['stage2_epochs']}  "
-                  f"Loss: {loss.item():.6f}  "
-                  f"α_std: {alpha_std:.4f}  α_abs_mean: {alpha_abs:.4f}  "
-                  f"LR: {lr:.3e}")
-
-    refined_alpha = model.ode_func.alpha_param.detach().cpu().numpy()
+    refined_alpha = model.ode_func.alpha_fixed.detach().cpu().numpy()
     return ecg_to_osc_mlp, losses, refined_alpha
 
 
@@ -887,9 +888,6 @@ def save_with_splits(arr, name, region_dir, T_train):
     np.save(f"{region_dir}/{name}_train.npy", arr[:T_train])
     np.save(f"{region_dir}/{name}_test.npy",  arr[T_train:])
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pipeline per region
-# ──────────────────────────────────────────────────────────────────────────────
 
 def run_pipeline_for_region(
     region_idx, cfg, Sw_all, non_zero_indices_per_row,
@@ -943,7 +941,7 @@ def run_pipeline_for_region(
     trained_mlp, stage2_losses, refined_alpha = train_mlp_on_frozen_brain(
         trained_heart_model, heart_osc_layer,
         initial_brain_params, Sc_reduced_osc,
-        N, D_full_func, t_train, cfg_local, device,
+        N, D_full_func, t_train, t_test, cfg_local, device,
         t_sec=train_sec,
     )
     final_brain_params = {**initial_brain_params, "alpha": refined_alpha}
