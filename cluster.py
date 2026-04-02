@@ -113,7 +113,7 @@ CONFIG = {
     "feedback_seed":   99,
 
     # Stage 4
-    "stage4_epochs":         10,
+    "stage4_epochs":         150,
     "stage4_lr":             1e-3,
     "stage4_sched_factor":   0.5,
     "stage4_sched_patience": 20,
@@ -812,7 +812,7 @@ def train_feedback_stage(trained_heart_model, trained_mlp_model,
                           heart_osc_layer, final_brain_params,
                           Sc_reduced_osc, N, D_full_func,
                           t_train, ecg_train_processed, cfg, device):
-    print("\n--- Stage 4: Brain→Heart Feedback Training ---")
+    print("\n--- Stage 4: Brain→Heart Feedback Training (joint encoder reset) ---")
 
     feedback_mlp = BrainToHeartFeedbackMLP(
         brain_dim=N, N_VNS=cfg["feedback_n_vns"],
@@ -820,51 +820,76 @@ def train_feedback_stage(trained_heart_model, trained_mlp_model,
         seed=cfg["feedback_seed"],
     ).to(device)
 
-    optimizer = torch.optim.Adam(
-        list(feedback_mlp.parameters()) + list(heart_osc_layer.parameters()),
-        lr=cfg["stage4_lr"],
-    )
+    # ── Reset HeartModel encoder + output layer weights ──
+    def reset_weights(m):
+        if hasattr(m, 'reset_parameters'):
+            m.reset_parameters()
+    trained_heart_model.feature_extractor.apply(reset_weights)
+    trained_heart_model.output_layer.apply(reset_weights)
+
+    D_full_train = D_full_func(t_train)
+    D_true       = torch.tensor(D_full_train, device=device, dtype=torch.float32)
+    T_train      = len(t_train)
+    target_ecg   = torch.tensor(
+        ecg_train_processed[::10], dtype=torch.float32, device=device
+    ).unsqueeze(1)
+
+    criterion = CorrelationLoss()
+
+    # ── Joint optimizer: feedback MLP + encoder (slower lr) + osc layer ──
+    optimizer = torch.optim.Adam([
+        {"params": feedback_mlp.parameters(),                          "lr": cfg["stage4_lr"]},
+        {"params": trained_heart_model.feature_extractor.parameters(), "lr": cfg["stage4_lr"] * 0.3},
+        {"params": trained_heart_model.output_layer.parameters(),      "lr": cfg["stage4_lr"] * 0.3},
+        {"params": heart_osc_layer.parameters(),                       "lr": cfg["stage4_lr"] * 0.1},
+    ])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min",
         factor=cfg["stage4_sched_factor"],
         patience=cfg["stage4_sched_patience"],
         min_lr=cfg["stage4_min_lr"],
     )
-    criterion    = CorrelationLoss()
-    T_train      = len(t_train)
-    target_ecg   = torch.tensor(
-        ecg_train_processed[::10], dtype=torch.float32, device=device
-    ).unsqueeze(1)
-    D_full_train = D_full_func(t_train)
-    losses       = []
 
-    # Precompute frozen quantities once
-    with torch.no_grad():
-        sim_plain   = heart_osc_layer(T_train, modulation=None).detach()
-        hidden      = trained_heart_model.get_features(sim_plain).detach()
-        brain_drive = torch.clamp(trained_mlp_model(hidden), -5.0, 5.0).detach()
-        model_brain = TorchRevHopfNetwork(
-            mu=cfg["brain_mu"], D_full=D_full_train, N=N,
-            Sc=Sc_reduced_osc, brain_drive_full=brain_drive,
-            fs=cfg["fs_model"], fixed_params=final_brain_params,
-            device=device, learn_alpha=False,
-        )
-        r_br, phi_br, _, _, _, _ = model_brain.solve(
+    # Build brain model once — brain params stay fixed, only drive changes
+    brain_model = TorchRevHopfNetwork(
+        mu=cfg["brain_mu"], D_full=D_full_train, N=N,
+        Sc=Sc_reduced_osc, brain_drive_full=None,
+        fs=cfg["fs_model"], fixed_params=final_brain_params,
+        device=device, learn_alpha=False,
+    )
+
+    losses = []
+
+    for epoch in range(cfg["stage4_epochs"]):
+        # ── Step 1: unmodulated heart osc → encoder features → brain drive ──
+        sim_plain   = heart_osc_layer(T_train, modulation=None)
+        hidden      = trained_heart_model.get_features(sim_plain)   # gradients flow through encoder
+        brain_drive = torch.clamp(trained_mlp_model(hidden), -5.0, 5.0)
+        brain_model.ode_func.brain_drive_full = brain_drive
+
+        # ── Step 2: solve brain ODE with live drive ──
+        r_br, phi_br, _, _, _, _ = brain_model.solve(
             final_brain_params["r"], final_brain_params["phi"],
             t_train, use_adjoint=False,
         )
-        rcos_phi = (r_br * torch.cos(phi_br)).detach()
 
-    for epoch in range(cfg["stage4_epochs"]):
-        modulation    = feedback_mlp(rcos_phi)
+        # ── Step 3: live brain state → modulation signal ──
+        rcos_phi   = r_br * torch.cos(phi_br)   # (T, N) — not detached
+        modulation = feedback_mlp(rcos_phi)      # (T, 2)
+
+        # ── Step 4: modulated heart osc → encoder → predicted ECG ──
         sim_modulated = heart_osc_layer(T_train, modulation=modulation)
-        pred_ecg      = trained_heart_model(sim_modulated)
-        loss          = criterion(pred_ecg.squeeze(), target_ecg.squeeze())
+        pred_ecg      = trained_heart_model(sim_modulated)   # encoder now trainable
+
+        loss = criterion(pred_ecg.squeeze(), target_ecg.squeeze())
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(feedback_mlp.parameters()) + list(heart_osc_layer.parameters()),
+            list(feedback_mlp.parameters()) +
+            list(trained_heart_model.feature_extractor.parameters()) +
+            list(trained_heart_model.output_layer.parameters()) +
+            list(heart_osc_layer.parameters()),
             max_norm=cfg["stage4_grad_clip"],
         )
         optimizer.step()
